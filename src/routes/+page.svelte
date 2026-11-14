@@ -1,0 +1,370 @@
+<script>
+	import { cn } from '$lib/utils.js';
+	import Menubar from '$lib/components/ui/patterns/menubar/index.js';
+	import { Button } from '$lib/components/ui/primitives/button/index.js';
+	import StatusBadge from '$lib/components/ui/patterns/status-badge/status-badge.svelte';
+	import WellSelector from '$lib/components/ui/custom/well-selector.svelte';
+	import RigDashboard from '$lib/components/ui/custom/rig-dashboard.svelte';
+	import ClassificationLog from '$lib/components/ui/custom/classification-log.svelte';
+	import AccuracyPanel from '$lib/components/ui/custom/accuracy-panel.svelte';
+	import PlaybackControls from '$lib/components/ui/custom/playback-controls.svelte';
+	import MinimizeIcon from '@lucide/svelte/icons/minimize-2';
+	import SpinnerIcon from '@lucide/svelte/icons/loader';
+	import SettingsIcon from '@lucide/svelte/icons/settings';
+	import {
+		fetchWells,
+		fetchWellChunk,
+		fetchMixedOffset,
+		classifyWindow
+	} from '$lib/api/drilling.js';
+
+	// Mirrors src/lib/server/newton.js DEFAULT_CONFIG; used for display in Live Evaluation.
+	const DEFAULT_CONFIG = {
+		windowSize: 128,
+		stepSize: 128,
+		nShotPerClass: 2000,
+		nNeighbors: 3,
+		metric: 'euclidean',
+		weights: 'uniform',
+		algorithm: 'ball_tree'
+	};
+
+	const WINDOW_SIZE = DEFAULT_CONFIG.windowSize;
+	const STEP_SIZE = DEFAULT_CONFIG.stepSize;
+
+	const CHUNK_SIZE = 5000;
+
+	let wells = $state([]);
+	let selectedWell = $state(null);
+	let wellData = $state([]);
+	let wellTotal = $state(0);
+	let dataStartOffset = $state(0);
+	let loadedOffset = $state(0);
+	let loadingChunk = $state(false);
+	let playheadIndex = $state(0);
+	let playing = $state(false);
+	let playInterval = $state(null);
+
+	let sessionId = $state(null);
+	let sessionStatus = $state('idle');
+	let setupStep = $state('');
+	let advancedMode = $state(false);
+
+	let classifications = $state([]);
+	let expanded = $state(null);
+
+	// Direct Query is slower than the playback tick, so we classify the window
+	// *under the playhead* (skipping windows we can't keep up with) rather than
+	// sequentially from the start — verdicts track what you're watching. Up to
+	// MAX_IN_FLIGHT windows run concurrently, so consecutive windows near the
+	// playhead get scored as it advances. `scheduled` dedupes; `runId` discards
+	// in-flight results after a reset/stop.
+	const MAX_IN_FLIGHT = 3;
+	let inFlight = 0;
+	let scheduled = new Set();
+	let runId = 0;
+
+	async function loadWells() {
+		try {
+			const data = await fetchWells();
+			wells = data.wells;
+		} catch (err) {
+			console.error('Failed to load wells:', err);
+		}
+	}
+
+	async function handleWellSelect(well) {
+		selectedWell = well;
+		playheadIndex = 0;
+		classifications = [];
+		resetClassifier();
+		playing = false;
+		loadedOffset = 0;
+		wellData = [];
+		wellTotal = 0;
+		if (playInterval) clearInterval(playInterval);
+
+		// Auto-seek to the section with the best drilling/not-drilling mix
+		// so the demo starts with both classes visible, not a long single-class stretch.
+		const mixed = await fetchMixedOffset(well.id, WINDOW_SIZE);
+		dataStartOffset = mixed.offset || 0;
+
+		await loadNextChunk(well.id, dataStartOffset);
+		playheadIndex = 0;
+	}
+
+	async function loadNextChunk(wellFile, offset) {
+		if (loadingChunk) return;
+		loadingChunk = true;
+		try {
+			const data = await fetchWellChunk(wellFile || selectedWell?.id, offset, CHUNK_SIZE);
+			wellData = [...wellData, ...data.rows];
+			wellTotal = data.total;
+			loadedOffset = offset + data.rows.length;
+		} catch (err) {
+			console.error('Failed to load chunk:', err);
+		} finally {
+			loadingChunk = false;
+		}
+	}
+
+	function maybeLoadMore() {
+		// Load next chunk when playhead is within 1000 rows of the end of loaded data.
+		// Compare against wellData.length (local) not loadedOffset (absolute file position)
+		// because playheadIndex is a local index into wellData.
+		if (selectedWell && loadedOffset < wellTotal && playheadIndex > wellData.length - 1000) {
+			loadNextChunk(selectedWell.id, loadedOffset);
+		}
+	}
+
+	function resetClassifier() {
+		runId++; // invalidate any in-flight results
+		inFlight = 0;
+		scheduled = new Set();
+	}
+
+	function handleStart() {
+		// No lens session — Direct Query is stateless. "Start" just arms the
+		// analysis: reset state and classify the first window so there's a verdict
+		// before Play.
+		if (sessionId) {
+			classifications = [];
+			resetClassifier();
+			return;
+		}
+
+		sessionStatus = 'active';
+		sessionId = 'direct-query';
+		setupStep = '';
+		classifications = [];
+		resetClassifier();
+		maybeClassify(); // seed the window at the current playhead
+	}
+
+	// Insert a verdict keeping classifications ordered by window position, so the
+	// log reads in order and `currentState` (last entry) is the one nearest the
+	// playhead even when results complete out of order.
+	function addClassification(entry) {
+		const arr = [...classifications];
+		let i = arr.length;
+		while (i > 0 && arr[i - 1].windowStart > entry.windowStart) i--;
+		arr.splice(i, 0, entry);
+		classifications = arr;
+	}
+
+	// Classify the window under the playhead (option a) with a small concurrency
+	// pool (option b). Skips windows already scored/in-flight and any the pool is
+	// too busy to take — coverage stays dense near the playhead, with gaps when
+	// playback outruns the classifier.
+	function maybeClassify() {
+		if (!sessionId || !wellData.length || inFlight >= MAX_IN_FLIGHT) return;
+		const target = Math.floor(playheadIndex / STEP_SIZE);
+		if (scheduled.has(target)) return;
+		const start = target * STEP_SIZE;
+		const end = start + WINDOW_SIZE;
+		if (end > wellData.length) return; // window not fully loaded yet
+
+		scheduled.add(target);
+		inFlight++;
+		const myRun = runId;
+		classifyWindow(wellData.slice(start, end), DEFAULT_CONFIG.nNeighbors)
+			.then((result) => {
+				if (myRun !== runId) return; // discarded by a reset/stop
+				addClassification({
+					id: crypto.randomUUID(),
+					label: result.label,
+					votes: result.votes,
+					neighbors: result.neighbors,
+					windowStart: start,
+					windowEnd: end
+				});
+			})
+			.catch((err) => {
+				if (myRun === runId) scheduled.delete(target); // allow a retry
+				console.error('Classify failed:', err);
+			})
+			.finally(() => {
+				if (myRun === runId) inFlight--;
+			});
+	}
+
+	function handlePlay() {
+		if (!wellData.length) return;
+		playing = true;
+
+		playInterval = setInterval(() => {
+			if (playheadIndex < wellData.length - 1) {
+				playheadIndex = Math.min(playheadIndex + 20, wellData.length - 1);
+			}
+
+			maybeLoadMore();
+			if (sessionId) maybeClassify();
+
+			if (playheadIndex >= wellData.length - 1 && loadedOffset >= wellTotal) {
+				playing = false;
+				clearInterval(playInterval);
+			}
+		}, 100);
+	}
+
+	function handlePause() {
+		playing = false;
+		if (playInterval) clearInterval(playInterval);
+	}
+
+	function handleReset() {
+		playing = false;
+		if (playInterval) clearInterval(playInterval);
+		playheadIndex = 0;
+		classifications = [];
+		resetClassifier();
+	}
+
+	function handleStop() {
+		handlePause();
+		resetClassifier();
+		sessionId = null;
+		sessionStatus = 'idle';
+	}
+
+	function toggleExpand(panel) {
+		expanded = expanded === panel ? null : panel;
+	}
+
+	$effect(() => {
+		loadWells();
+	});
+</script>
+
+{#snippet partnerSnippet()}
+	<span class="font-mono text-sm tracking-wider text-muted-foreground uppercase"
+		>Drilling Monitor</span
+	>
+{/snippet}
+
+<div
+	class="grid h-screen w-screen grid-rows-[auto_auto_auto_1fr] overflow-hidden bg-background text-foreground"
+>
+	<Menubar partnerLogo={partnerSnippet}>
+		<div class="flex items-center gap-3">
+			{#if sessionStatus === 'active'}
+				<StatusBadge label="Newton" percentage={100} initial="N" />
+			{/if}
+			{#if sessionStatus === 'connecting'}
+				<Button variant="default" size="sm" disabled>
+					<SpinnerIcon class="size-3.5 animate-spin" />
+					{setupStep || 'Connecting...'}
+				</Button>
+			{:else if !sessionId}
+				<Button variant="default" size="sm" onclick={handleStart} disabled={!selectedWell}>
+					Start Analysis
+				</Button>
+			{:else}
+				<Button variant="outline" size="sm" onclick={handleStop}>Stop</Button>
+			{/if}
+		</div>
+		<Button
+			variant={advancedMode ? 'default' : 'ghost'}
+			size="icon-sm"
+			aria-label="Toggle advanced mode"
+			onclick={() => {
+				advancedMode = !advancedMode;
+			}}
+		>
+			<SettingsIcon class="size-3.5" />
+		</Button>
+	</Menubar>
+
+	<div class="flex items-center gap-6 border-b border-border px-4 py-2">
+		<WellSelector {wells} bind:selected={selectedWell} onselect={handleWellSelect} />
+		{#if !sessionId}
+			<div class="hidden items-center gap-4 text-xs text-muted-foreground lg:flex">
+				<span
+					><span
+						class="mr-1 inline-flex size-5 items-center justify-center rounded-full bg-muted font-mono text-[10px] text-foreground"
+						>1</span
+					> Select a well</span
+				>
+				<span
+					><span
+						class="mr-1 inline-flex size-5 items-center justify-center rounded-full bg-muted font-mono text-[10px] text-foreground"
+						>2</span
+					> Start Analysis</span
+				>
+				<span
+					><span
+						class="mr-1 inline-flex size-5 items-center justify-center rounded-full bg-muted font-mono text-[10px] text-foreground"
+						>3</span
+					> Press Play</span
+				>
+			</div>
+		{/if}
+	</div>
+
+	<div class="flex items-center gap-4 border-b border-border px-4 py-2">
+		<PlaybackControls
+			{playing}
+			current={dataStartOffset + playheadIndex}
+			total={wellTotal}
+			wellName={selectedWell?.shortName ?? ''}
+			timestamp={wellData[playheadIndex]?.DATE_TIME ?? null}
+			onplay={handlePlay}
+			onpause={handlePause}
+			onreset={handleReset}
+		/>
+	</div>
+
+	<main
+		class={cn(
+			'grid gap-4 overflow-hidden p-4',
+			advancedMode
+				? 'grid-cols-[3fr_1fr_2fr] grid-rows-[minmax(0,1fr)]'
+				: 'grid-cols-[2fr_1fr] grid-rows-[minmax(0,1fr)]'
+		)}
+	>
+		<RigDashboard
+			rows={wellData}
+			{playheadIndex}
+			{classifications}
+			currentState={classifications.length > 0
+				? classifications[classifications.length - 1].label
+				: null}
+			wellIndex={wells.findIndex((w) => w.id === selectedWell?.id)}
+			onexpand={() => toggleExpand('rig')}
+			class="max-h-full overflow-hidden"
+		/>
+
+		<ClassificationLog {classifications} class="max-h-full" />
+
+		{#if advancedMode}
+			<div class="min-h-0 overflow-y-auto">
+				<AccuracyPanel {classifications} rows={wellData} config={DEFAULT_CONFIG} />
+			</div>
+		{/if}
+	</main>
+</div>
+
+<!-- Fullscreen overlay -->
+{#if expanded}
+	<div class="fixed inset-0 z-50 flex flex-col overflow-hidden bg-background">
+		<div class="flex items-center justify-between border-b border-border px-4 py-2">
+			<span class="font-mono text-sm tracking-wider text-foreground uppercase">Drilling Rig</span>
+			<Button variant="outline" size="sm" onclick={() => (expanded = null)}>
+				<MinimizeIcon class="size-3.5" />
+				Close
+			</Button>
+		</div>
+		<div class="min-h-0 flex-1 p-4">
+			<RigDashboard
+				rows={wellData}
+				{playheadIndex}
+				{classifications}
+				currentState={classifications.length > 0
+					? classifications[classifications.length - 1].label
+					: null}
+				wellIndex={wells.findIndex((w) => w.id === selectedWell?.id)}
+				class="h-full"
+			/>
+		</div>
+	</div>
+{/if}

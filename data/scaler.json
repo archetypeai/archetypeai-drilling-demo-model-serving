@@ -1,0 +1,44 @@
+{
+  "columns": [
+    "BPOS",
+    "DBTM",
+    "FLWI",
+    "HDTH",
+    "HKLD",
+    "ROP",
+    "RPM",
+    "SPPA",
+    "WOB"
+  ],
+  "mean": {
+    "BPOS": 18.22704,
+    "DBTM": 1581.9647304,
+    "FLWI": 0,
+    "HDTH": 3442.0113024,
+    "HKLD": 82.3522834251556,
+    "ROP": 30.80999934,
+    "RPM": 0,
+    "SPPA": 446.999980933214,
+    "WOB": 0
+  },
+  "std": {
+    "BPOS": 19.789485470126017,
+    "DBTM": 2093.95855567917,
+    "FLWI": 1682.3869827684136,
+    "HDTH": 663.6380728883619,
+    "HKLD": 48.36217921375353,
+    "ROP": 69.8865639495923,
+    "RPM": 44.47739065974796,
+    "SPPA": 12637.07620572952,
+    "WOB": 1.5164578122312826
+  },
+  "config": {
+    "method": "robust (median + IQR/1.349)",
+    "referenceWells": [
+      "Norway-StatoilHydro-15_$47$_9-F-10.csv",
+      "Norway-StatoilHydro-15_$47$_9-F-4.csv"
+    ],
+    "samplesUsed": 491153,
+    "builtAt": "2026-06-25T07:09:58.601Z"
+  }
+}

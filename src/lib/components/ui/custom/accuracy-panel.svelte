@@ -1,0 +1,187 @@
+<script>
+	import { cn } from '$lib/utils.js';
+	import BackgroundCard from '$lib/components/ui/patterns/background-card/index.js';
+	import Badge from '$lib/components/ui/primitives/badge/index.js';
+	import { ScrollArea } from '$lib/components/ui/primitives/scroll-area/index.js';
+	import TargetIcon from '@lucide/svelte/icons/target';
+
+	const ACTC_TO_LABEL = {
+		'1': 'DRILLING',
+		'2': 'DRILLING',
+		'3': 'NOT_DRILLING',
+		'4': 'NOT_DRILLING',
+		'8': 'NOT_DRILLING',
+		'9': 'NOT_DRILLING'
+	};
+
+	let {
+		classifications = [],
+		rows = [],
+		config = {},
+		class: className,
+		...restProps
+	} = $props();
+
+	// For each classification, derive ground truth from ACTC in the same window
+	let evaluated = $derived.by(() => {
+		return classifications.map((cls) => {
+			const windowRows = rows.slice(cls.windowStart, cls.windowEnd);
+			const actcCounts = { DRILLING: 0, NOT_DRILLING: 0, UNKNOWN: 0 };
+
+			for (const row of windowRows) {
+				const actc = row?.ACTC?.trim();
+				const label = ACTC_TO_LABEL[actc];
+				if (label) actcCounts[label]++;
+				else actcCounts.UNKNOWN++;
+			}
+
+			// Only evaluate unanimous windows (all rows same label)
+			let groundTruth = null;
+			const total = actcCounts.DRILLING + actcCounts.NOT_DRILLING;
+			if (total > 0 && actcCounts.UNKNOWN === 0) {
+				if (actcCounts.DRILLING === total) groundTruth = 'DRILLING';
+				else if (actcCounts.NOT_DRILLING === total) groundTruth = 'NOT_DRILLING';
+				// else: mixed window → skip
+			}
+
+			const correct = groundTruth ? cls.label === groundTruth : null;
+			return { ...cls, groundTruth, correct, skipped: !groundTruth };
+		});
+	});
+
+	let stats = $derived.by(() => {
+		const scorable = evaluated.filter((e) => !e.skipped);
+		const correct = scorable.filter((e) => e.correct).length;
+		const incorrect = scorable.filter((e) => !e.correct).length;
+		const total = scorable.length;
+		const accuracy = total > 0 ? ((correct / total) * 100).toFixed(1) : '--';
+		const skipped = evaluated.filter((e) => e.skipped).length;
+
+		// Per-class breakdown
+		const tp = scorable.filter((e) => e.label === 'DRILLING' && e.correct).length;
+		const fp = scorable.filter((e) => e.label === 'DRILLING' && !e.correct).length;
+		const fn = scorable.filter((e) => e.label === 'NOT_DRILLING' && e.groundTruth === 'DRILLING').length;
+		const tn = scorable.filter((e) => e.label === 'NOT_DRILLING' && e.correct).length;
+
+		const precision = tp + fp > 0 ? ((tp / (tp + fp)) * 100).toFixed(1) : '--';
+		const recall = tp + fn > 0 ? ((tp / (tp + fn)) * 100).toFixed(1) : '--';
+
+		// Macro F1: average of per-class F1 scores
+		const drillP = tp + fp > 0 ? tp / (tp + fp) : 0;
+		const drillR = tp + fn > 0 ? tp / (tp + fn) : 0;
+		const drillF1 = drillP + drillR > 0 ? 2 * drillP * drillR / (drillP + drillR) : 0;
+		const notP = tn + fn > 0 ? tn / (tn + fn) : 0;
+		const notR = tn + fp > 0 ? tn / (tn + fp) : 0;
+		const notF1 = notP + notR > 0 ? 2 * notP * notR / (notP + notR) : 0;
+		const f1 = total > 0 ? (((drillF1 + notF1) / 2) * 100).toFixed(1) : '--';
+
+		return { correct, incorrect, total, accuracy, skipped, tp, fp, fn, tn, precision, recall, f1 };
+	});
+
+</script>
+
+<BackgroundCard
+	title="Live Evaluation"
+	icon={TargetIcon}
+	class={cn('flex flex-col gap-3', className)}
+	{...restProps}
+>
+	<p class="text-muted-foreground text-[10px]">
+		Unanimous windows only. Mixed/transition windows are skipped.
+	</p>
+
+	<!-- F1 + accuracy gauge -->
+	<div class="flex flex-wrap items-center gap-3">
+		<div class="flex flex-col items-center">
+			<span class="text-foreground font-mono text-xl font-medium">
+				{stats.f1}{stats.f1 !== '--' ? '%' : ''}
+			</span>
+			<span class="text-muted-foreground text-[10px]">F1</span>
+		</div>
+		<div class="flex flex-col items-center">
+			<span class="text-foreground font-mono text-xl font-medium">
+				{stats.accuracy}{stats.accuracy !== '--' ? '%' : ''}
+			</span>
+			<span class="text-muted-foreground text-[10px]">Accuracy</span>
+		</div>
+		<div class="flex flex-col gap-0.5">
+			<div class="flex gap-2 font-mono text-xs">
+				<span class="text-atai-good">{stats.correct} correct</span>
+				<span class="text-atai-critical">{stats.incorrect} wrong</span>
+				{#if stats.skipped > 0}
+					<span class="text-muted-foreground">{stats.skipped} skipped</span>
+				{/if}
+			</div>
+			<div class="flex gap-2 font-mono text-xs">
+				<span class="text-muted-foreground">Precision: {stats.precision}%</span>
+				<span class="text-muted-foreground">Recall: {stats.recall}%</span>
+			</div>
+		</div>
+	</div>
+
+	<!-- Confusion matrix -->
+	{#if stats.total > 0}
+		<div class="border-border rounded-xs border p-2">
+			<p class="text-muted-foreground mb-1 text-xs">Confusion Matrix (predicted vs actual)</p>
+			<div class="grid grid-cols-[auto_1fr_1fr] gap-1 font-mono text-xs">
+				<span></span>
+				<span class="text-muted-foreground text-center">Actual Drill</span>
+				<span class="text-muted-foreground text-center">Actual Not</span>
+				<span class="text-muted-foreground">Pred Drill</span>
+				<span class="text-atai-good text-center">{stats.tp} TP</span>
+				<span class="text-atai-critical text-center">{stats.fp} FP</span>
+				<span class="text-muted-foreground">Pred Not</span>
+				<span class="text-atai-critical text-center">{stats.fn} FN</span>
+				<span class="text-atai-good text-center">{stats.tn} TN</span>
+			</div>
+		</div>
+	{/if}
+
+	<!-- Current config -->
+	<div class="border-border rounded-xs border p-2">
+		<p class="text-muted-foreground mb-1 text-xs">Current Config</p>
+		<div class="grid grid-cols-2 gap-x-4 gap-y-0.5 font-mono text-xs">
+			<span class="text-muted-foreground">Window size</span>
+			<span class="text-foreground">{config.windowSize ?? 25}</span>
+			<span class="text-muted-foreground">Step size</span>
+			<span class="text-foreground">{config.stepSize ?? 25}</span>
+			<span class="text-muted-foreground">N-shot/class</span>
+			<span class="text-foreground">{config.nShotPerClass ?? 500}</span>
+			<span class="text-muted-foreground">K neighbors</span>
+			<span class="text-foreground">{config.nNeighbors ?? 5}</span>
+			<span class="text-muted-foreground">Metric</span>
+			<span class="text-foreground">{config.metric ?? 'manhattan'}</span>
+			<span class="text-muted-foreground">Weights</span>
+			<span class="text-foreground">{config.weights ?? 'uniform'}</span>
+			<span class="text-muted-foreground">Algorithm</span>
+			<span class="text-foreground">{config.algorithm ?? 'ball_tree'}</span>
+		</div>
+	</div>
+
+	<!-- Recent predictions with correctness -->
+	<ScrollArea class="min-h-0 flex-1">
+		<div class="flex flex-col gap-0.5 pr-3">
+			{#each [...evaluated].reverse().slice(0, 50) as e (e.id)}
+				<div class="grid grid-cols-[auto_auto_auto_auto] items-center gap-1.5 px-1 py-0.5 font-mono text-xs">
+					{#if e.skipped}
+						<span class="text-muted-foreground">?</span>
+					{:else if e.correct}
+						<span class="text-atai-good">✓</span>
+					{:else}
+						<span class="text-atai-critical">✗</span>
+					{/if}
+					<span class={cn(
+						'truncate rounded-xs border px-1 py-0.5',
+						e.label === 'DRILLING' ? 'border-[#22d3ee]/30 text-[#22d3ee]' : 'border-[#f97316]/30 text-[#f97316]'
+					)}>
+						{e.label === 'DRILLING' ? 'DRILL' : 'NOT'}
+					</span>
+					<span class="text-muted-foreground">
+						{e.groundTruth ? (e.groundTruth === e.label ? '=' : '≠') : '?'}{e.groundTruth === 'DRILLING' ? 'DRILL' : e.groundTruth === 'NOT_DRILLING' ? 'NOT' : '?'}
+					</span>
+					<span class="text-muted-foreground text-right">{e.windowStart}-{e.windowEnd}</span>
+				</div>
+			{/each}
+		</div>
+	</ScrollArea>
+</BackgroundCard>
