@@ -8,7 +8,8 @@
 // labeled reference, mixed/other windows are skipped. The unanimous windows are
 // pooled per class across the reference wells and evenly subsampled to CAP each
 // (a balanced library that doesn't take forever to embed), then each window is
-// embedded per-channel via /query and concatenated.
+// embedded with Omega 1.5 through an Inference API session, all nine channels
+// in one query.
 //
 // Output: data/knn-library.json
 //   { config: { windowSize, stepSize, model, referenceWells, builtAt },
@@ -17,38 +18,12 @@
 //
 // Usage: node scripts/build-knn-library.js [--window=128] [--step=128] [--cap=18]
 
-import { readFileSync, writeFileSync, mkdirSync, existsSync } from 'fs';
+import { readFileSync, writeFileSync, mkdirSync } from 'fs';
 import { resolve, dirname } from 'path';
-import { REFERENCE_WELLS, ACTC_DRILLING, ACTC_NOT_DRILLING } from '../src/lib/reference-wells.js';
+import { OmegaSession, OMEGA_MODEL } from '../src/lib/inference-client.js';
+import { REFERENCE_WELLS } from '../src/lib/reference-wells.js';
+import { DATA_COLUMNS, applyScaler, collectWindows, subsample } from './windows.js';
 
-const DATA_COLUMNS = ['BPOS', 'DBTM', 'FLWI', 'HDTH', 'HKLD', 'ROP', 'RPM', 'SPPA', 'WOB'];
-const MODEL = 'OmegaEncoder::omega_embeddings_1_4';
-const WELLS_DIR = 'static/data/wells';
-const DRILL = new Set(ACTC_DRILLING);
-const NOT = new Set(ACTC_NOT_DRILLING);
-
-const SCALER_PATH = resolve('data/scaler.json');
-const SCALER = existsSync(SCALER_PATH) ? JSON.parse(readFileSync(SCALER_PATH, 'utf-8')) : null;
-if (!SCALER) {
-	console.error('Missing data/scaler.json — run `node scripts/build-scaler.js` first.');
-	process.exit(1);
-}
-const SCALE_CLIP = 10; // must match src/lib/server/newton.js
-function applyScaler(channelFirstWindow, columns) {
-	const out = new Array(columns.length);
-	for (let c = 0; c < columns.length; c++) {
-		const m = SCALER.mean[columns[c]] ?? 0;
-		const s = SCALER.std[columns[c]] ?? 1;
-		const src = channelFirstWindow[c];
-		const dst = new Array(src.length);
-		for (let i = 0; i < src.length; i++) {
-			const z = (src[i] - m) / s;
-			dst[i] = z > SCALE_CLIP ? SCALE_CLIP : z < -SCALE_CLIP ? -SCALE_CLIP : z;
-		}
-		out[c] = dst;
-	}
-	return out;
-}
 
 function loadEnv() {
 	const env = {};
@@ -68,93 +43,12 @@ function parseArgs() {
 	return args;
 }
 
-function readCsv(filePath) {
-	const text = readFileSync(filePath, 'utf-8');
-	const lines = text.split(/\r?\n/).filter((l) => l.trim());
-	const headers = lines[0].split(',').map((h) => h.trim());
-	return { headers, rows: lines.slice(1).map((l) => l.split(',')) };
-}
-
-// Collect unanimous-label windows (channel-first 2D) from one well.
-function collectWindows(well, windowSize, stepSize) {
-	const { headers, rows } = readCsv(resolve(WELLS_DIR, well));
-	const colIdx = DATA_COLUMNS.map((c) => headers.indexOf(c));
-	const actcIdx = headers.indexOf('ACTC');
-	if (colIdx.some((i) => i < 0) || actcIdx < 0) throw new Error(`${well}: missing column`);
-	const found = { DRILLING: [], NOT_DRILLING: [] };
-	for (let start = 0; start + windowSize <= rows.length; start += stepSize) {
-		let allD = true;
-		let allN = true;
-		for (let r = 0; r < windowSize; r++) {
-			const code = rows[start + r][actcIdx]?.trim();
-			if (DRILL.has(code)) allN = false;
-			else if (NOT.has(code)) allD = false;
-			else {
-				allD = false;
-				allN = false;
-			}
-		}
-		const label = allD ? 'DRILLING' : allN ? 'NOT_DRILLING' : null;
-		if (!label) continue;
-		const win = colIdx.map((ci) => {
-			const ch = new Array(windowSize);
-			for (let r = 0; r < windowSize; r++) {
-				const v = parseFloat(rows[start + r][ci]);
-				ch[r] = isNaN(v) ? 0 : v;
-			}
-			return ch;
-		});
-		found[label].push(win);
-	}
-	return found;
-}
-
-// Evenly subsample `cap` windows across the pool (temporal diversity, deterministic).
-function subsample(arr, cap) {
-	if (arr.length <= cap) return arr;
-	const step = arr.length / cap;
-	const out = [];
-	for (let i = 0; i < cap; i++) out.push(arr[Math.floor(i * step)]);
-	return out;
-}
-
-async function queryOmegaChannel(endpoint, apiKey, channel) {
-	const res = await fetch(endpoint, {
-		method: 'POST',
-		headers: { Authorization: `Bearer ${apiKey}`, 'Content-Type': 'application/json' },
-		body: JSON.stringify({
-			query: '',
-			model: MODEL,
-			normalize_input: false,
-			events: [{ type: 'data.numeric_array', event_data: { contents: [channel] } }]
-		})
-	});
-	if (!res.ok) throw new Error(`/query failed: ${res.status} ${(await res.text()).slice(0, 300)}`);
-	const data = await res.json();
-	const vec = data.response?.response;
-	if (!Array.isArray(vec) || typeof vec[0] !== 'number') {
-		throw new Error(`unexpected response shape: ${JSON.stringify(data).slice(0, 300)}`);
-	}
-	return vec;
-}
-
-async function embedWindow(endpoint, apiKey, channelFirstWindow) {
-	const perChannel = await Promise.all(
-		channelFirstWindow.map((ch) => queryOmegaChannel(endpoint, apiKey, ch))
-	);
-	const cols = perChannel[0].length;
-	const out = new Array(perChannel.length * cols);
-	for (let r = 0; r < perChannel.length; r++) {
-		for (let c = 0; c < cols; c++) out[r * cols + c] = perChannel[r][c];
-	}
-	return out;
-}
+let session = null;
 
 async function main() {
 	const env = loadEnv();
 	const args = parseArgs();
-	const endpoint = env.ATAI_API_ENDPOINT.replace(/\/$/, '') + '/v0.5/query';
-	console.log(`Endpoint: ${endpoint}`);
+	console.log(`Endpoint: ${env.ATAI_API_ENDPOINT}`);
 	console.log(`Window: ${args.window}, Step: ${args.step}, Cap/class: ${args.cap}`);
 	console.log(`Reference wells: ${REFERENCE_WELLS.join(', ')}`);
 
@@ -177,31 +71,27 @@ async function main() {
 		`Selected: ${selected.DRILLING.length} drilling + ${selected.NOT_DRILLING.length} not-drilling`
 	);
 
-	const embeddings = [];
+	session = new OmegaSession({
+		endpoint: env.ATAI_API_ENDPOINT,
+		apiKey: env.ATAI_API_KEY,
+		windowSize: args.window
+	});
 	const t0 = Date.now();
+	const jobs = [];
 	for (const label of ['DRILLING', 'NOT_DRILLING']) {
 		for (const win of selected[label]) {
-			const scaled = applyScaler(win, DATA_COLUMNS);
-			let attempt = 0;
-			while (true) {
-				try {
-					embeddings.push({ label, vec: await embedWindow(endpoint, env.ATAI_API_KEY, scaled) });
-					break;
-				} catch (err) {
-					if (++attempt >= 6) throw err;
-					await new Promise((r) => setTimeout(r, 1000 * attempt));
-				}
-			}
+			jobs.push(session.embed(applyScaler(win, DATA_COLUMNS)).then((vec) => ({ label, vec: Array.from(vec) })));
 		}
-		console.log(`  embedded ${label}: ${selected[label].length}`);
 	}
+	const embeddings = await Promise.all(jobs);
+	await session.close();
 
 	const elapsed = ((Date.now() - t0) / 1000).toFixed(1);
 	const lib = {
 		config: {
 			windowSize: args.window,
 			stepSize: args.step,
-			model: MODEL,
+			model: OMEGA_MODEL,
 			referenceWells: REFERENCE_WELLS,
 			builtAt: new Date().toISOString()
 		},
@@ -216,7 +106,8 @@ async function main() {
 	console.log(`\nWrote ${outPath} (${sizeMb} MB, ${embeddings.length} windows) in ${elapsed}s`);
 }
 
-main().catch((err) => {
+main().catch(async (err) => {
 	console.error('FATAL:', err);
+	await session?.close();
 	process.exit(1);
 });

@@ -1,8 +1,7 @@
 #!/usr/bin/env node
 // Compute a per-channel ROBUST scaler (median + IQR) over the held-out reference
-// wells (see src/lib/reference-wells.js). Used to pre-normalize every window
-// before /query, with `normalize_input: false` so Omega sees consistent
-// amplitudes across windows. Fitting on the reference pool only (not the wells
+// wells (see src/lib/reference-wells.js). Every window is scaled with it before
+// it goes to Omega, so Omega sees consistent amplitudes across windows. Fitting on the reference pool only (not the wells
 // we classify) keeps the split leakage-free.
 //
 // Why robust (median/IQR) instead of mean/std: the raw Volve well files contain

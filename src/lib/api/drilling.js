@@ -12,7 +12,7 @@ export async function fetchMixedOffset(wellFile, windowSize = 128, numWindows = 
 	return res.json();
 }
 
-// Classify one window of sensor rows via Direct Query + local KNN.
+// Classify one window of sensor rows with Omega embeddings + local KNN.
 // Returns { label: 'DRILLING'|'NOT_DRILLING', votes, neighbors }.
 export async function classifyWindow(rows, k) {
 	const res = await fetch('/api/classify', {

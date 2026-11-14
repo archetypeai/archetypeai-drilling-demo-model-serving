@@ -1,12 +1,9 @@
 import { ATAI_API_KEY, ATAI_API_ENDPOINT } from '$env/static/private';
 import { readFileSync, existsSync } from 'fs';
 import { resolve } from 'path';
+import { OmegaSession } from '$lib/inference-client.js';
 
-const API_VERSION = 'v0.5';
-const OMEGA_MODEL = 'OmegaEncoder::omega_embeddings_1_4';
-
-// The nine drilling sensor channels. Identical to the original Lens-based demo
-// and to the n-shot CSV headers, so the same reference data builds the library.
+// The nine drilling sensor channels, in the order the library was built with.
 export const DATA_COLUMNS = ['BPOS', 'DBTM', 'FLWI', 'HDTH', 'HKLD', 'ROP', 'RPM', 'SPPA', 'WOB'];
 
 export const DEFAULT_CONFIG = {
@@ -15,15 +12,10 @@ export const DEFAULT_CONFIG = {
 	nNeighbors: 3
 };
 
-function apiUrl(path) {
-	return `${ATAI_API_ENDPOINT.replace(/\/$/, '')}/${API_VERSION}${path}`;
-}
-
 // ──────────────────────────────────────────────────────────────────────
 // Global per-channel robust scaler (data/scaler.json), loaded lazily.
-// Pre-normalizing every window with these fixed stats — and passing
-// normalize_input=false to Omega — preserves cross-window amplitude signal
-// that per-window normalization would erase. See scripts/build-scaler.js.
+// Scaling every window with these fixed stats, rather than normalizing each
+// window on its own, preserves the cross-window amplitude signal. See scripts/build-scaler.js.
 // Scaled values are clipped to ±SCALE_CLIP so sensor-glitch sentinels in the
 // raw well data (e.g. SPPA spikes to ~1e31) can't dominate the embedding. The
 // library was built with the same clip, so live and reference stay comparable.
@@ -91,104 +83,32 @@ export function getLibraryConfig() {
 }
 
 // ──────────────────────────────────────────────────────────────────────
-// Direct Query: Omega embedding (one /query per channel)
+// Inference API: Omega 1.5 embeddings from one long-lived session
 // ──────────────────────────────────────────────────────────────────────
 
-const OMEGA_TIMEOUT_MS = 15000;
-
-async function postQuery(body, timeoutMs = OMEGA_TIMEOUT_MS) {
-	const controller = new AbortController();
-	const t = setTimeout(() => controller.abort(), timeoutMs);
-	try {
-		const res = await fetch(apiUrl('/query'), {
-			method: 'POST',
-			headers: {
-				Authorization: `Bearer ${ATAI_API_KEY}`,
-				'Content-Type': 'application/json'
-			},
-			body: JSON.stringify(body),
-			signal: controller.signal
+// One session per server process, kept on globalThis so Vite's hot reload
+// reuses it instead of opening another. The session is cancelled on Ctrl-C
+// (see vite.config.js) and on SIGINT/SIGTERM when running a production build.
+function getOmegaSession() {
+	if (!globalThis.__drillingOmegaSession) {
+		const session = new OmegaSession({
+			endpoint: ATAI_API_ENDPOINT,
+			apiKey: ATAI_API_KEY,
+			windowSize: DEFAULT_CONFIG.windowSize,
+			maxInFlight: 6
 		});
-		if (!res.ok) {
-			const err = await res.text();
-			throw new Error(`/query failed: ${res.status} ${err.slice(0, 300)}`);
-		}
-		return res.json();
-	} finally {
-		clearTimeout(t);
+		const shutdown = () => session.close().finally(() => process.exit(0));
+		process.once('SIGINT', shutdown);
+		process.once('SIGTERM', shutdown);
+		globalThis.__drillingOmegaSession = session;
 	}
+	return globalThis.__drillingOmegaSession;
 }
 
-// Bounded per-channel fan-out (matches the Omega skill's thread-pool / `embed()`
-// pattern). One /query per channel, but cap how many run at once so a window's
-// fan-out doesn't overrun a capacity-limited node. Each call retries transient
-// failures (504 / timeout) instead of dropping the whole window.
-const OMEGA_MAX_CONCURRENCY = 6;
-const OMEGA_RETRIES = 3;
-
-let omegaInFlight = 0;
-const omegaQueue = [];
-function withOmegaSlot(fn) {
-	return new Promise((resolve, reject) => {
-		const run = () => {
-			omegaInFlight++;
-			Promise.resolve()
-				.then(fn)
-				.then(resolve, reject)
-				.finally(() => {
-					omegaInFlight--;
-					const next = omegaQueue.shift();
-					if (next) next();
-				});
-		};
-		if (omegaInFlight < OMEGA_MAX_CONCURRENCY) run();
-		else omegaQueue.push(run);
-	});
-}
-
-// Embed a single channel (flat 768-d vector), retrying transient failures.
-async function embedChannel(channel) {
-	let lastErr;
-	for (let attempt = 0; attempt < OMEGA_RETRIES; attempt++) {
-		try {
-			const data = await postQuery({
-				query: '',
-				model: OMEGA_MODEL,
-				// Pre-normalized at the call site via applyScaler(); Omega should NOT
-				// re-normalize per-window or it would erase cross-window amplitude.
-				normalize_input: false,
-				events: [{ type: 'data.numeric_array', event_data: { contents: [channel] } }]
-			});
-			const vec = data.response?.response;
-			if (!Array.isArray(vec) || typeof vec[0] !== 'number') {
-				throw new Error(`unexpected Omega response shape: ${JSON.stringify(data).slice(0, 200)}`);
-			}
-			return vec;
-		} catch (err) {
-			lastErr = err;
-			if (attempt < OMEGA_RETRIES - 1) {
-				await new Promise((r) => setTimeout(r, 400 * (attempt + 1)));
-			}
-		}
-	}
-	throw lastErr;
-}
-
-// Send a [num_columns x window_size] channel-first array to Omega and return
-// the per-channel 768-d embeddings concatenated into one Float32Array for KNN.
-export async function embedWindow(channelFirstWindow) {
-	const perChannel = await Promise.all(
-		channelFirstWindow.map((channel) => withOmegaSlot(() => embedChannel(channel)))
-	);
-	const numChannels = perChannel.length;
-	const dim = perChannel[0].length;
-	const out = new Float32Array(numChannels * dim);
-	for (let c = 0; c < numChannels; c++) {
-		for (let d = 0; d < dim; d++) {
-			out[c * dim + d] = perChannel[c][d];
-		}
-	}
-	return out;
+// Embed a [channels x windowSize] window in one query. Returns the per-channel
+// 768-d vectors concatenated, in channel order, for KNN.
+export function embedWindow(channelFirstWindow) {
+	return getOmegaSession().embed(channelFirstWindow);
 }
 
 // ──────────────────────────────────────────────────────────────────────
@@ -240,15 +160,11 @@ function extractWindow(rows, columns) {
 	);
 }
 
-// Run Direct Query → KNN for one window of sensor rows.
+// Embed one window of sensor rows with Omega and classify it with KNN.
 // Returns { label, votes, neighbors }.
 export async function classifyWindow(rows, { k = DEFAULT_CONFIG.nNeighbors } = {}) {
 	const win = extractWindow(rows, DATA_COLUMNS);
 	const scaled = applyScaler(win, DATA_COLUMNS);
 	const embedding = await embedWindow(scaled);
 	return classifyEmbedding(embedding, k);
-}
-
-export function getApiKey() {
-	return ATAI_API_KEY;
 }

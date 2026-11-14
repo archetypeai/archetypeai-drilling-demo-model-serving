@@ -53,7 +53,7 @@
 	let classifications = $state([]);
 	let expanded = $state(null);
 
-	// Direct Query is slower than the playback tick, so we classify the window
+	// Classifying a window is slower than the playback tick, so we classify the window
 	// *under the playhead* (skipping windows we can't keep up with) rather than
 	// sequentially from the start — verdicts track what you're watching. Up to
 	// MAX_IN_FLIGHT windows run concurrently, so consecutive windows near the
@@ -124,8 +124,8 @@
 	}
 
 	function handleStart() {
-		// No lens session — Direct Query is stateless. "Start" just arms the
-		// analysis: reset state and classify the first window so there's a verdict
+		// The server opens its Omega session on the first classification. "Start"
+		// just arms the analysis: reset state and classify the first window so there's a verdict
 		// before Play.
 		if (sessionId) {
 			classifications = [];
@@ -134,7 +134,7 @@
 		}
 
 		sessionStatus = 'active';
-		sessionId = 'direct-query';
+		sessionId = 'inference-api';
 		setupStep = '';
 		classifications = [];
 		resetClassifier();

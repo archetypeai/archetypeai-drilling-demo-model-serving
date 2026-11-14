@@ -1,8 +1,7 @@
 import { json } from '@sveltejs/kit';
 import { classifyWindow, DEFAULT_CONFIG } from '$lib/server/newton.js';
 
-// Synchronous per-window classification via Direct Query + local KNN.
-// Replaces the SSE session/stream routes from the Lens version.
+// Per-window classification: Omega 1.5 embeddings (Inference API) + local KNN.
 //   Request:  { rows: [{ BPOS: '...', ... }, ...], k? }   length == windowSize
 //   Response: { label: 'DRILLING'|'NOT_DRILLING', votes, neighbors: [...] }
 export async function POST({ request }) {
