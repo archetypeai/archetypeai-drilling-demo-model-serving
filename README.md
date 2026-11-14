@@ -2,7 +2,9 @@
 
 Drilling state classification dashboard powered by [Newton](https://www.archetypeai.io/) and the [Equinor Volve Data Village](https://www.equinor.com/energy/volve-data-sharing).
 
-Plays back real drilling sensor data from 14 wells in the Volve oil field (North Sea, 2007–2009 drilling phase) and uses Newton's **Direct Query API** to classify each data window as **drilling** or **not_drilling**: every window is embedded per-channel by the Omega encoder (one stateless `/query` call per sensor) and scored by a **local KNN** against an n-shot reference library — no lens, no session, no SSE. Includes live evaluation against ACTC ground truth.
+Plays back real drilling sensor data from 14 wells in the Volve oil field (North Sea, 2007–2009 drilling phase) and classifies each data window as **drilling** or **not_drilling**: **Newton Omega 1.5** embeds every window through the Archetype AI **Inference API**, and a **local KNN** scores it against an n-shot reference library. Includes live evaluation against ACTC ground truth.
+
+Moved from the [Direct Query version](https://github.com/archetypeai/archetypeai-drilling-demo) (Omega 1.4 on `/api/lens/query`). See [MIGRATION.md](MIGRATION.md) for what changed and how the two compare.
 
 > The Volve field operated 2007–2016, but real-time drilling sensor data only covers the 2007–2009 construction phase. After 2009 the rig left and the field moved to production (different file types, no real-time WITSML streams).
 
@@ -13,10 +15,10 @@ Plays back real drilling sensor data from 14 wells in the Volve oil field (North
 - **14 wells** from the Volve North Sea oil field, sorted by class balance (wells with both drilling and not-drilling activity first)
 - **Rig instrument panel** — SVG drilling rig with 10 live sensor sparklines (9 channels + ACTC ground truth)
 - **Playback controls** — play, pause, reset with progress bar, human-friendly timestamps
-- **Direct Query classification** — each 128-sample window is embedded by Omega (`/query`) and classified by a local KNN as drilling or not_drilling
+- **Inference API classification** — each 128-sample window is embedded by Omega 1.5 in one session query and classified by a local KNN as drilling or not_drilling
 - **Classification log** — scrolling list of predictions with drilling/not-drilling counts
 - **N-shot library (leakage-free)** — built offline from two **held-out reference wells** (F-10, F-4) that are excluded from the well selector, so every well you can classify is genuinely unseen. Unanimous-ACTC windows from those wells are embedded into a local KNN library (`data/knn-library.json`) by `scripts/build-knn-library.js`
-- **Synchronous per-window inference** — `POST /api/classify` returns the verdict for each window directly (no streaming session to manage)
+- **Synchronous per-window inference** — `POST /api/classify` returns the verdict for each window directly; the server keeps one Omega session open and reuses it
 - **Incremental data loading** — full raw CSVs (up to 1.9M rows) loaded in 5,000-row chunks during playback
 - **Auto-seek** — automatically starts playback at the section with the best drilling/not-drilling balance (scored by unanimous windows, not raw rows)
 
@@ -26,28 +28,30 @@ Plays back real drilling sensor data from 14 wells in the Volve oil field (North
 
 ## Notes on the Encoder
 
-The classifier embeds with `OmegaEncoder::omega_embeddings_1_4` (generic time-series encoder, the current prod default per the [`atai-newton-omega-model`](https://github.com/archetypeai/agent-skills/tree/main/skills/atai-newton-omega-model) skill). Each sensor channel is sent as its own `/query` call with `normalize_input: false`; every window is pre-normalized with a fixed global scaler (`data/scaler.json`) so cross-window amplitude is preserved rather than erased by per-window normalization. The per-channel 768-d embeddings are concatenated into the joint feature the KNN compares.
+The classifier embeds with **Omega 1.5** (`omega-embedding` on the Inference API). Every window is scaled with a fixed global scaler (`data/scaler.json`) first, so cross-window amplitude is preserved rather than erased by per-window normalization. All nine channels go to the session in one query, and the per-channel 768-d embeddings come back concatenated in channel order: the joint 6,912-d feature the KNN compares.
 
-The encoder is hardcoded to `omega_embeddings_1_4`. To try a different encoder, change `OMEGA_MODEL` in `src/lib/server/newton.js` **and** in `scripts/build-knn-library.js`, then rebuild the library — the library embeddings and the live query path must use the same encoder, since different encoders produce different vectors (same `[N × 768]` shape, different values) and KNN distances over them are not comparable.
+The library and the live query path must use the same encoder and window length: different encoders produce unrelated vectors (same shape, different values), and KNN distances across them mean nothing. If you change `OMEGA_MODEL` in `src/lib/inference-client.js` or `windowSize` in `DEFAULT_CONFIG`, rebuild the library.
 
-**Per-well accuracy (held-out, prod).** Measured against prod (`omega_embeddings_1_4`) with the leakage-free library, scoring up to 15 unanimous-ACTC windows per class per well (window=128, k=3), DRILLING as the positive class:
+### Per-well accuracy
+
+`node scripts/eval-wells.js` scores the library on every playable well. For each well it takes up to 15 unanimous-ACTC windows per class, evenly spaced through the well (window 128, k=3), with DRILLING as the positive class. On production (Omega 1.5, 2026-11-13; about 2 minutes):
 
 | Well | Accuracy | F1 | Eval windows |
-|---|---:|---:|---|
+|---|---:|---:|---:|
+| F-1 | 100% | 100% | 30 |
 | F-14 | 100% | 100% | 30 |
-| F-9 | 93% | 93% | 30 |
-| F-12 | 93% | 93% | 30 |
-| F-5 (NA-NA) | 90% | 91% | 30 |
-| F-5 (StatoilHydro) | 87% | 87% | 30 |
-| F-15S | 83% | 81% | 30 |
-| F-1 | 83% | 80% | 30 |
-| F-7 | 83% | 80% | 30 |
+| F-9 | 100% | 100% | 30 |
+| F-12 | 97% | 97% | 30 |
+| F-5 (NA-NA) | 93% | 94% | 30 |
+| F-5 (StatoilHydro) | 93% | 94% | 30 |
+| F-7 | 93% | 93% | 30 |
+| F-15S | 87% | 86% | 30 |
 | F-9 A † | 83% | 85% | 24 |
-| F-15B † | 65% | 79% | 17 |
-| F-15 † | 65% | 77% | 20 |
-| F-15A † | 38% | 55% | 29 |
+| F-15B † | 71% | 83% | 17 |
+| F-15 † | 50% | 67% | 20 |
+| F-15A † | 41% | 56% | 29 |
 
-Across the **8 wells with substantive both-class activity**, held-out accuracy averages **~88%** (F1 ~88%) — and these are *genuinely unseen* wells (the references come only from held-out F-10 + F-4). That's notably better than the pre-fix figures, which were measured under data leakage and a different encoder.
+Across the **8 wells with substantive both-class activity**, held-out accuracy averages **95%** (F1 95%), and these are genuinely unseen wells: the references come only from the held-out F-10 and F-4. [MIGRATION.md](MIGRATION.md) compares this with Omega 1.4 on the same windows.
 
 † **Single-class wells** (>99% drilling: F-9 A, F-15, F-15A, F-15B) have only 2–14 not-drilling windows in the entire well, so a balanced sample over-weights that rare class and the metric is noisy/misleading — see [Single-class wells show misleading metrics](#single-class-wells-show-misleading-metrics). They're sorted to the end of the selector.
 
@@ -55,7 +59,8 @@ Across the **8 wells with substantive both-class activity**, held-out accuracy a
 
 - **SvelteKit** with Svelte 5 runes
 - **Archetype AI Design System** — semantic tokens, component primitives, composite patterns
-- **Newton Direct Query API** — per-channel Omega `/query` embeddings + local KNN classification
+- **Archetype AI Inference API** — Omega 1.5 embeddings from one session + local KNN classification
+- **Geist and Geist Mono** — open-source fonts (SIL Open Font License) in place of the design system's PP Neue Montreal
 - **Tailwind v4** — styling with semantic design tokens
 
 ## Dataset
@@ -78,22 +83,26 @@ The [Equinor Volve Data Village](https://www.equinor.com/energy/volve-data-shari
 
 ## Setup
 
-Requires [Git LFS](https://git-lfs.com) (the well CSVs and the precomputed KNN library are stored via LFS):
+Requires Node.js 20 or later and [Git LFS](https://git-lfs.com) (the 14 well CSVs, about 1.1 GB, are stored via LFS):
 
 ```bash
 git lfs install
-git clone <repo>          # LFS pulls static/data/wells/*.csv and data/knn-library.json
+git clone https://github.com/archetypeai/archetypeai-drilling-demo-model-serving.git
+cd archetypeai-drilling-demo-model-serving
 npm install
+cp .env.example .env      # then add your API key
 ```
 
-Create a `.env` file:
+`.env` holds your Archetype AI API key and the production endpoint:
 
 ```
 ATAI_API_KEY=your_api_key_here
-ATAI_API_ENDPOINT=https://api.u1.archetypeai.app/
+ATAI_API_ENDPOINT=https://platform.u1.archetypeai.app
 ```
 
-`data/scaler.json` and `data/knn-library.json` are **committed** (the library via Git LFS), so the demo runs out of the box — no build step needed for a normal run.
+The `.env` file wins over any `ATAI_*` variables exported in your shell (see `vite.config.js`).
+
+`data/scaler.json` and `data/knn-library.json` are committed, so the demo runs out of the box — no build step needed for a normal run.
 
 Rebuild the reference library only if you change the held-out reference wells, the window size, or the encoder:
 
@@ -102,7 +111,9 @@ node scripts/build-scaler.js        # data/scaler.json  (per-channel robust medi
 node scripts/build-knn-library.js   # data/knn-library.json  (labeled Omega embeddings)
 ```
 
-Both read the held-out reference wells from `src/lib/reference-wells.js`; `build-knn-library.js` reads `.env` directly.
+Both read the held-out reference wells from `src/lib/reference-wells.js`; `build-knn-library.js` reads `.env` directly. Building the library takes about 15 seconds.
+
+To score the library on every playable well: `node scripts/eval-wells.js` (see [Per-well accuracy](#per-well-accuracy)).
 
 ## Development
 
@@ -115,10 +126,10 @@ Open `http://localhost:5173`, select a well, click **Start Analysis**, then pres
 ## How It Works
 
 1. Select a well — data loads incrementally from full raw CSVs (up to 1.9M rows per well)
-2. **Start Analysis** arms the analysis (no lens session — Direct Query is stateless) and classifies the first window
+2. **Start Analysis** arms the analysis and classifies the first window; that first call opens the server's Omega session
 3. Press **Play** — data plays back at accelerated speed, advancing the rig sparklines and playhead
 4. The window **under the playhead** is POSTed to `/api/classify` (up to 3 in flight), so verdicts track what's on screen
-5. The server pre-normalizes the window with the global scaler, embeds each channel via Omega `/query` (`normalize_input: false`), concatenates the per-channel vectors, and runs a local KNN against `data/knn-library.json`
+5. The server scales the window with the global scaler, sends all nine channels to the Omega session in one query (one 768-d vector per channel comes back, in channel order), and runs a local KNN against `data/knn-library.json`
 6. The verdict returns synchronously and appears as colored bands on the rig and entries in the classification log
 
 ## Architecture
@@ -133,7 +144,8 @@ src/
 │       ├── wells/data/+server.js     # Paginated well data chunks
 │       └── wells/mixed-offset/       # Find best mixed section (auto-seek)
 ├── lib/
-│   ├── server/newton.js              # Direct Query embedding + local KNN
+│   ├── inference-client.js           # Inference API client: Omega session, retries, Newton query
+│   ├── server/newton.js              # Omega session per server + local KNN
 │   ├── reference-wells.js            # Held-out reference wells (F-10, F-4) + ACTC code sets
 │   ├── api/drilling.js               # Client-side fetch wrappers (classifyWindow)
 │   └── components/ui/custom/
@@ -144,8 +156,10 @@ src/
 │       └── well-selector.svelte      # Well button grid
 ├── scripts/
 │   ├── build-scaler.js               # Offline: per-channel scaler → data/scaler.json
-│   └── build-knn-library.js          # Offline: embed n-shot refs → data/knn-library.json
-├── data/                             # scaler.json (committed) + knn-library.json (committed via Git LFS)
+│   ├── build-knn-library.js          # Offline: embed n-shot refs → data/knn-library.json
+│   ├── eval-wells.js                 # Score the library on every playable well
+│   └── windows.js                    # Window helpers shared by the scripts
+├── data/                             # scaler.json + knn-library.json (both committed)
 └── static/data/
     └── wells/                        # 14 full raw well CSVs (Git LFS).
                                       # F-10 + F-4 are the held-out reference pool
@@ -154,15 +168,36 @@ src/
 
 ## Newton API Pattern
 
-This demo uses the **Direct Query API** with the Omega encoder — the same time-series pattern as the [SWaT water-treatment demo](https://github.com/archetypeai/archetypeai-swat-demo-direct-query), and the [`atai-newton-omega-model`](https://github.com/archetypeai/agent-skills/tree/main/skills/atai-newton-omega-model) skill's recommended downstream shape:
+This demo calls Omega 1.5 through the **Inference API**: the same time-series pattern as the [SWaT water-treatment demo](https://github.com/archetypeai/archetypeai-swat-demo-model-serving) and the [wind turbine demo](https://github.com/archetypeai/archetypeai-wind-turbine-demo-model-serving).
 
-| Pattern | Used In | API |
-|---------|---------|-----|
-| Vision (multi-frame `/query`) | Traffic, Wildfire | Image → classification |
-| Text reasoning (`/query`) | Earthquake, Grid | Structured text → analysis |
-| **Omega embeddings + local KNN (`/query`)** | **Drilling, SWaT, Wind Turbine** | **Time-series → state classification** |
+The server opens one Omega session with a 128-sample window and reuses it for every query:
 
-There is no lens and no session: classification is `embed each channel via /query → concatenate → KNN against the local library`, entirely under our control.
+```json
+POST /api/inference/sessions
+{ "model": "omega-embedding", "values": { "window_size": 128, "step_size": 128 } }
+→ 201 { "id": "<session id>" }
+```
+
+Each query carries one window, channel first:
+
+```json
+POST /api/inference/sessions/{id}/query
+{
+  "model": "omega-embedding",
+  "query": "",
+  "events": [
+    { "type": "data.numeric_array", "event_data": { "contents": [[/* BPOS: 128 values */], [/* DBTM */], "... 9 channels"] } }
+  ]
+}
+```
+
+The answer is one row of `9 × 768` values, the per-channel vectors in channel order:
+
+```json
+{ "response": { "success": true, "response": [[/* 6,912 values */]] } }
+```
+
+Classification is `scale → embed all 9 channels in one query → KNN against the local library`. The session is cancelled when the server stops. `src/lib/inference-client.js` handles retries, reopening an expired session and a bounded number of queries in flight.
 
 ## Classifier Config
 
@@ -172,13 +207,13 @@ There is no lens and no session: classification is `embed each channel via /quer
 { windowSize: 128, stepSize: 128, nNeighbors: 3 }   // KNN metric: euclidean
 ```
 
-The window/step were tuned with [newton-streaming-optimizer](https://github.com/archetypeai/newton-streaming-optimizer) (F1 climbed monotonically with window size: w32=85.4% → w64=97.1% → w128=100% on the bundled slice). The library is built at the same `windowSize`/`stepSize` by `scripts/build-knn-library.js`; the encoder is `OmegaEncoder::omega_embeddings_1_4` with `normalize_input: false` over the global scaler.
+The window/step were tuned with [newton-streaming-optimizer](https://github.com/archetypeai/newton-streaming-optimizer) on Omega 1.4. The library is built at the same `windowSize`/`stepSize` by `scripts/build-knn-library.js`, and the session's `window_size` is the same 128.
 
 ## Known Limitations
 
 ### Accuracy varies widely by well
 
-Held-out prod accuracy is **~88% across the 8 both-class wells** (see the per-well table above), but it varies with each well's operational profile, transition frequency, and similarity to the reference wells, and the single-class wells score lower on a balanced sample. This isn't a bug — it's the inherent limitation of few-shot classification with a generic encoder.
+Held-out prod accuracy is **95% across the 8 both-class wells** (see the per-well table above), but it varies with each well's operational profile, transition frequency, and similarity to the reference wells, and the single-class wells score lower on a balanced sample. This isn't a bug — it's the inherent limitation of few-shot classification with a generic encoder.
 
 ### No "I don't know" answer
 
@@ -198,12 +233,20 @@ The references come from two **held-out wells** — F-10 (drilling-rich) and F-4
 
 > Earlier versions sampled the n-shot examples (the bundled `volve_drilling.csv` / `volve_not_drilling.csv`) from across *all* wells, which leaked reference rows into the very wells being scored and flattered accuracy on the wells that contributed most. Those files were removed; the library is now built from the held-out wells only.
 
-### Direct Query latency
+### Latency
 
-Each window fans out 9 per-channel `/query` calls (bounded to 6 concurrent, with retries) — roughly 1–3 s per window. To stay aligned with playback, the UI classifies the window **under the playhead** rather than sequentially from the start, with up to 3 windows in flight at once (`MAX_IN_FLIGHT` in `+page.svelte`). Verdicts therefore track what's on screen; at fast playback some windows between are skipped (the log is sparse but every entry is relevant). The library is precomputed offline, so there's no per-session warm-up wait.
+One window takes about 0.3 s on production (median of 15 queries; the first query also opens the session, about 0.7 s). The UI still classifies the window **under the playhead** rather than sequentially from the start, with up to 3 windows in flight at once (`MAX_IN_FLIGHT` in `+page.svelte`), so verdicts track what's on screen even at fast playback. The library is precomputed offline, so there's no per-session warm-up wait.
+
+### Sessions
+
+The server holds one Omega session while it runs, and cancels it when it stops (Ctrl-C in `npm run dev`, or SIGINT/SIGTERM for a production build). If a process is killed without that, the session stays open until it expires; an organization can have 16 open sessions per model.
 
 ## Data Attribution
 
 The drilling sensor data used in these examples is from the **Equinor Volve Data Village**, released under a modified CC BY 4.0 license. The data may be used for commercial and non-commercial purposes but may not be resold.
 
 > Data provided by Equinor and the former Volve license partners (ExxonMobil Exploration & Production Norway AS and Bayerngas Norge AS). [Terms and Conditions](https://www.equinor.com/energy/volve-data-sharing).
+
+## Licence
+
+The code is licensed under the [Apache License 2.0](LICENSE). The Volve well data in `static/data/wells/` is not covered by that licence; it is Equinor's, under the terms above.

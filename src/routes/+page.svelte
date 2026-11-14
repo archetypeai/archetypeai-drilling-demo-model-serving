@@ -22,11 +22,11 @@
 	const DEFAULT_CONFIG = {
 		windowSize: 128,
 		stepSize: 128,
-		nShotPerClass: 2000,
+		nShotPerClass: 18, // scripts/build-knn-library.js --cap
 		nNeighbors: 3,
 		metric: 'euclidean',
 		weights: 'uniform',
-		algorithm: 'ball_tree'
+		algorithm: 'brute force'
 	};
 
 	const WINDOW_SIZE = DEFAULT_CONFIG.windowSize;
