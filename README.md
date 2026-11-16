@@ -87,8 +87,8 @@ Requires Node.js 20 or later and [Git LFS](https://git-lfs.com) (the 14 well CSV
 
 ```bash
 git lfs install
-git clone https://github.com/archetypeai/archetypeai-drilling-demo-model-serving.git
-cd archetypeai-drilling-demo-model-serving
+git clone https://github.com/archetypeai/archetypeai-drilling-demo-inference-api.git
+cd archetypeai-drilling-demo-inference-api
 npm install
 cp .env.example .env      # then add your API key
 ```
@@ -168,7 +168,7 @@ src/
 
 ## Newton API Pattern
 
-This demo calls Omega 1.5 through the **Inference API**: the same time-series pattern as the [SWaT water-treatment demo](https://github.com/archetypeai/archetypeai-swat-demo-model-serving) and the [wind turbine demo](https://github.com/archetypeai/archetypeai-wind-turbine-demo-model-serving).
+This demo calls Omega 1.5 through the **Inference API**: the same time-series pattern as the [SWaT water-treatment demo](https://github.com/archetypeai/archetypeai-swat-demo-inference-api) and the [wind turbine demo](https://github.com/archetypeai/archetypeai-wind-turbine-demo-inference-api).
 
 The server opens one Omega session with a 128-sample window and reuses it for every query:
 
